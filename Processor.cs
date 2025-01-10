@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Threading.Tasks;
 using System.Text.Json;
 using System.Windows;
+using System.IO;
 
 namespace startup
 {
@@ -68,7 +69,6 @@ namespace startup
         {
             if (input.Length == 0) { return Array.Empty<string>(); }
             string[] WordList = this._processor.InputChangeProcess(input);
-            if (WordList.Length == 1 && WordList[0] == input) return Array.Empty<string>();
             return WordList;
         }
 
@@ -163,27 +163,46 @@ namespace startup
                 _nsfwAllowed = !_nsfwAllowed;
                 return new PluginRequest(NextProcessor.Self, new ProcessorRequest(ProcessorRequestType.PluginRemain, ""));
             }
+            if (input == "exit")
+            {
+                this._sql.Close();
+                Environment.Exit(0);
+            }
             SQLResult<Queue<RawConfigure>> result = _sql.GetCommandInfo(input, _nsfwAllowed);
             if (result.status != SQLStatus.Success)
             {
                 MessageBox.Show($"执行错误，错误码：{result.status}.");
                 return new PluginRequest(NextProcessor.None, new ProcessorRequest(ProcessorRequestType.Close, ""));
             }
-            return new PluginRequest(NextProcessor.Next, new ProcessorRequest(ProcessorRequestType.PluginChange, ""), new Executer(result.result, input));
-
+            return new PluginRequest(
+                NextProcessor.Next, 
+                new ProcessorRequest(ProcessorRequestType.PluginChange, ""), 
+                new Executer(
+                    result.result, 
+                    input, 
+                    (name) => _sql.GetCommandInfo(name, this._nsfwAllowed)
+                )
+            );
         }
     }
 
     public class PluginProcessResult
     {
-        public string[] result;
+        public string[] result { get; set; }
     }
 
     public class PluginResult
     {
-        public bool Continue;
-        public bool Success;
-        public string Info;
+        public bool Continue { get; set; }
+        public bool Success { get; set; }
+        public bool Pipe { get; set; }
+        public InfoStruct Info { get; set; }
+    }
+
+    public class InfoStruct
+    {
+        public string name { get; set; }
+        public string input { get; set; }
     }
 
     public class ProcessResult<T>
@@ -205,12 +224,16 @@ namespace startup
         private bool _isContinue = false;
         private bool _isCancel = false;
 
+        private Func<string, SQLResult<Queue<RawConfigure>>> _getCommandInfoCallback;
+
         private string Name;
 
-        public Executer(Queue<RawConfigure> c, string name)
+
+        public Executer(Queue<RawConfigure> c, string name, Func<string, SQLResult<Queue<RawConfigure>>> getCommandInfoCallback)
         {
             _rawConfigures = c;
             this.Name = name;
+            _getCommandInfoCallback = getCommandInfoCallback;
         }
 
 
@@ -257,6 +280,28 @@ namespace startup
                         _configure.Waitable = true;
                     }else
                         _isContinue= false;
+
+                    if (result.Pipe)
+                    {
+                        try
+                        {
+                            var nextCommandResult = _getCommandInfoCallback(result.Info.name);
+                            
+                            if (nextCommandResult.status == SQLStatus.Success && nextCommandResult.result.Count == 1)
+                            {
+                                _configure = nextCommandResult.result.Dequeue();
+                                _configure.PresetInput = result.Info.input;
+                                _configure.Waitable = false;
+                                _isContinue = true;
+                                continue;
+                            }
+                        }
+                        catch
+                        {
+                            return new PluginRequest(NextProcessor.None,
+                                new ProcessorRequest(ProcessorRequestType.Close, ""));
+                        }
+                    }
                 }
 
                 return new PluginRequest(NextProcessor.None,
@@ -273,7 +318,7 @@ namespace startup
         {
             if (!_configure.Associatable) return Array.Empty<string>();
 
-            ProcessResult<PluginProcessResult> r = Processer<PluginProcessResult>("-I " + input);
+            ProcessResult<PluginProcessResult> r = Processer<PluginProcessResult>(input);
             try {
                 if (!r.Success) { return Array.Empty<string>(); }
                 return r.Result.result;
@@ -309,9 +354,14 @@ namespace startup
             ProcessStartInfo startInfo = new ProcessStartInfo();
             if (_configure.Executable)
             {
+                startInfo.FileName = _configure.SourcePath;
+            }
+            else 
+            {
                 if (string.IsNullOrEmpty(_configure.ExecutePath))
                 {
-                    startInfo.FileName = _configure.SourcePath;
+                    MessageBox.Show("配置不可执行");
+                    return new ProcessResult<T>(false, default);
                 }
                 else
                 {
@@ -319,36 +369,61 @@ namespace startup
                     startInfo.Arguments = _configure.SourcePath;
                 }
             }
-            else 
-            {
-                MessageBox.Show("配置不可执行");
-                return new ProcessResult<T>(false, default); 
-            }
 
             if (!string.IsNullOrEmpty(input))
             {
-                string argument = _configure.Associatable ? (typeof(T) == typeof(PluginProcessResult) ?
+                string argument = _configure.Associatable ? ((typeof(T) == typeof(PluginProcessResult) ?
                     "-I " + input :
-                    "-S " + input) : input;
+                    "-S " + input)) : input;
                 startInfo.Arguments += " " + argument;
             }
 
             startInfo.UseShellExecute = false;
             startInfo.RedirectStandardOutput = _configure.Associatable;
+            startInfo.RedirectStandardError = _configure.Associatable;
             startInfo.CreateNoWindow = true;
 
             using (Process process = Process.Start(startInfo))
             {
-                if (!_configure.Associatable) return new ProcessResult<T>(true, default);
-                string output = process.StandardOutput.ReadToEnd();
-                process.WaitForExit();
 
-                if (process.ExitCode != 0)
+                if (!_configure.Associatable) return new ProcessResult<T>(true, default);
+                using (StreamReader reader = process.StandardError)
                 {
-                    MessageBox.Show($"进程执行失败，退出码: {process.ExitCode}");
-                    return new ProcessResult<T>(false, default);
+                    string errorResult = reader.ReadToEnd();
+                    if (!string.IsNullOrEmpty(errorResult))
+                    {
+                        MessageBox.Show($"进程执行失败，退出码: {process.ExitCode}");
+                        return new ProcessResult<T>(false, default);
+                    }
                 }
-                return new ProcessResult<T>(true ,JsonSerializer.Deserialize<T>(output));
+                using (StreamReader reader = process.StandardOutput)
+                {
+                    string output = reader.ReadToEnd();
+                    string output_clean = output.Trim()
+                        .Replace('\'', '"')
+                        .Replace("\r", "")
+                        .Replace("\n", "");
+                    
+                    try 
+                    {
+                        var options = new JsonSerializerOptions
+                        {
+                            PropertyNameCaseInsensitive = true  
+                        };
+                        T outputT = JsonSerializer.Deserialize<T>(output_clean, options);
+                        if (outputT == null)
+                        {
+                            MessageBox.Show($"JSON反序列化失败。清理后的输出: {output_clean}");
+                            return new ProcessResult<T>(false, default);
+                        }
+                        return new ProcessResult<T>(true, outputT);
+                    }
+                    catch (JsonException ex)
+                    {
+                        MessageBox.Show($"JSON解析错误: {ex.Message}\n清理后的输出: {output_clean}");
+                        return new ProcessResult<T>(false, default);
+                    }
+                }
             }
         }
     }

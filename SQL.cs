@@ -156,6 +156,12 @@ namespace startup
 
         }
 
+        public void Close()
+        {
+            _sqlConnetion.Dispose();
+            return;
+        }
+
         public SQLResult<List<string>> Query(string input, bool nsfwAllowed)
         {
             try

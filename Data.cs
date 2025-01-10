@@ -1,6 +1,8 @@
 ﻿using System;
 using System.ComponentModel;
 using System.Windows;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace startup
 {
@@ -35,7 +37,7 @@ namespace startup
         void Reset();
     }
 
-    public class Repeater : INotifyPropertyChanged
+    public class Repeater : INotifyPropertyChanged, IDisposable
     {
         private IProcessor _subscriptor = new RP();
         private string _inputText = "";
@@ -45,6 +47,9 @@ namespace startup
         private String[] _wordList;
         private Visibility _listVisibility;
         private String _pluginName;
+        private CancellationTokenSource _suggestionCts;
+        private readonly int _debounceMs = 50;
+        private Task _currentSuggestionTask;
 
         public string[] WordList
         {
@@ -146,7 +151,8 @@ namespace startup
             }
             set
             {
-                if ((SelectedIndex == -1 && _inputText != value) || (SelectedIndex != -1 && value != WordList[SelectedIndex]))
+                if ((SelectedIndex == -1 && _inputText != value) || 
+                    (SelectedIndex != -1 && value != WordList[SelectedIndex]))
                 {
                     _selectedIndex = -1;
                     OnPropertyChanged(nameof(SelectedIndex));
@@ -154,12 +160,10 @@ namespace startup
                     _inputText = value;
                     OnPropertyChanged(nameof(InputText));
 
-                    WordList = InputChangeProcess();
-                    OnPropertyChanged(nameof(WordList));
-
-                    if (WordList.Length == 0) ListVisible = Visibility.Collapsed;
-                    else ListVisible = Visibility.Visible;
-                    OnPropertyChanged(nameof(ListVisible));
+                    _suggestionCts?.Cancel();
+                    _suggestionCts = new CancellationTokenSource();
+                    
+                    UpdateSuggestions(_suggestionCts.Token);
                 }
             }
         }
@@ -230,6 +234,41 @@ namespace startup
         private string[] InputChangeProcess()
         {
             return _subscriptor.InputChangeProcess(InputText);
+        }
+
+        private async void UpdateSuggestions(CancellationToken cancellationToken)
+        {
+            try
+            {
+                await Task.Delay(_debounceMs, cancellationToken);
+
+                var suggestions = await Task.Run(() => 
+                    InputChangeProcess(), cancellationToken);
+
+                if (!cancellationToken.IsCancellationRequested)
+                {
+                    WordList = suggestions;
+                    ListVisible = suggestions.Length > 0 ? 
+                        Visibility.Visible : Visibility.Collapsed;
+                    
+                    OnPropertyChanged(nameof(WordList));
+                    OnPropertyChanged(nameof(ListVisible));
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                WordList = Array.Empty<string>();
+                ListVisible = Visibility.Collapsed;
+            }
+        }
+
+        public void Dispose()
+        {
+            _suggestionCts?.Cancel();
+            _suggestionCts?.Dispose();
         }
 
         public event PropertyChangedEventHandler PropertyChanged;

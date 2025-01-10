@@ -101,6 +101,15 @@
                     public bool Continue;
                     public bool Success;
                     public string Info;
+
+                    public bool Pipe; // 是否需要调用其他命令, 仅当Continue为false时有效
+                    public InfoStruct Info; // 仅当Pipe为true时有效
+                }
+
+                public class InfoStruct
+                {
+                    public string name;  // 必须是已注册的 raw 命令名
+                    public string input; // 期望的预设输入
                 }
             ```
         - 不提供联想词服务的程序正常接收即可。
@@ -112,6 +121,7 @@
     4. 窗口不会自己调整位置。
     5. 偶发托盘图标异常增多又自己消失。
     6. 嵌套```proxy```尚未测试。
+    7. 在无其他命令输入状态情况下，键入```exit```可退出程序，键入```nsfw```可切换```nsfw```状态。  
             
 
 
